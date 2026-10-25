@@ -2,6 +2,8 @@ import asyncio
 import os
 import random
 import shutil
+import time
+from datetime import timedelta
 from collections import defaultdict
 
 import discord
@@ -59,6 +61,10 @@ YDL_OPTS.update(COOKIE_OPTS)
 # Bài tự động phát tiếp sẽ bỏ qua video dài hơn mức này (livestream, mix hàng giờ...)
 AUTO_MAX_SECONDS = 20 * 60
 
+# Tự xóa tin nhắn của bot đã cũ trong kênh được dùng lệnh (mặc định 30 phút).
+BOT_MESSAGE_TTL_SECONDS = 30 * 60
+MESSAGE_CLEANUP_INTERVAL_SECONDS = 5 * 60
+
 # Dữ liệu riêng cho từng server
 queues = defaultdict(list)                  # Hàng đợi phát lần lượt
 volumes = defaultdict(lambda: 1.0)           # 1.0 = 100%
@@ -67,12 +73,18 @@ autoplay = defaultdict(lambda: True)         # Tự phát tiếp khi hàng đợ
 history = defaultdict(list)                  # Lịch sử bài đã phát
 current_song = {}                            # Query bài đang phát
 play_channels = {}                           # Kênh nhắn thông báo phát nhạc
+command_channels = {}                        # Kênh gần nhất người dùng gọi lệnh bot
+play_positions = defaultdict(float)          # Vị trí phát hiện tại (giây)
+play_started_at = {}                         # Mốc monotonic khi bài đang chạy
+seeking = set()                              # Đang tua bài, ngăn callback tự nhảy bài
 return_pending = set()                       # Tránh lặp thao tác /return
 now_data = {}                                # Thông tin bài đang/vừa phát (tên, link, id YouTube...)
 now_playing_msg = {}                         # Tin nhắn menu điều khiển đang hiện
 recent_ids = defaultdict(list)               # id video YouTube đã phát (để không phát lặp)
 titles = {}                                  # query/link -> tên bài (để hiển thị đẹp hơn)
 stopping = set()                             # Server đang chạy /stop (chặn tự phát bài mới)
+auto_paused = set()                          # Server đang tạm dừng vì kênh thoại trống (tự tiếp tục khi có người về)
+waiting_for_listener = set()                 # Hết bài lúc kênh trống: chờ có người vào lại mới phát tiếp
 
 # Dữ liệu riêng cho từng người dùng
 favorites = defaultdict(list)                # user_id -> [{"title": ..., "url": ...}]
@@ -205,14 +217,37 @@ def find_related(video_id, title, played: set):
 
 # ==================== NOW PLAYING MENU ====================
 
+def current_position(gid: int) -> float:
+    """Vị trí phát hiện tại, có tính phần thời gian đã tạm dừng."""
+    position = play_positions.get(gid, 0.0)
+    started = play_started_at.get(gid)
+    if started is not None:
+        position += max(0.0, time.monotonic() - started)
+    return position
+
+
+def mark_track_paused(gid: int):
+    if gid in play_started_at:
+        play_positions[gid] = current_position(gid)
+        play_started_at.pop(gid, None)
+
+
+def mark_track_resumed(gid: int):
+    if gid not in play_started_at:
+        play_started_at[gid] = time.monotonic()
+
+
 async def clear_menu(gid: int):
-    """Gỡ nút khỏi menu cũ để không bấm nhầm vào bài đã qua."""
+    """Xóa hẳn menu của bài cũ để không để lại nút không còn dùng được."""
     msg = now_playing_msg.pop(gid, None)
     if msg:
         try:
-            await msg.edit(view=None)
+            await msg.delete()
         except Exception:
-            pass
+            try:
+                await msg.edit(view=None)
+            except Exception:
+                pass
 
 
 def build_now_playing_embed(data: dict, gid: int, auto: bool = False) -> discord.Embed:
@@ -231,13 +266,48 @@ def build_now_playing_embed(data: dict, gid: int, auto: bool = False) -> discord
     return embed
 
 
+class SeekPositionSelect(discord.ui.Select):
+    """Chọn nhanh mốc tua theo phần trăm, không cần nhập thời gian."""
+
+    def __init__(self, duration):
+        self.duration = int(duration) if duration else None
+        options = []
+        if self.duration and self.duration > 1:
+            seen = set()
+            for percent in (0, 10, 25, 50, 75, 90):
+                second = min(int(self.duration * percent / 100), self.duration - 1)
+                if second in seen:
+                    continue
+                seen.add(second)
+                stamp = fmt_duration(second) if second else "0:00"
+                options.append(discord.SelectOption(
+                    label=f"{percent}% · {stamp}",
+                    value=str(second),
+                    description=f"Tua đến khoảng {percent}% bài hát",
+                ))
+        if not options:
+            options = [discord.SelectOption(label="Không hỗ trợ tua bài này", value="0")]
+        super().__init__(
+            placeholder="🎯 Tua đến đoạn muốn nghe…",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=2,
+            disabled=not bool(self.duration and self.duration > 1),
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        await seek_interaction(inter, int(self.values[0]))
+
+
 class NowPlayingView(discord.ui.View):
     """Menu điều khiển hiện dưới tin nhắn 'Đang phát'."""
 
-    def __init__(self, gid: int, embed: discord.Embed):
+    def __init__(self, gid: int, embed: discord.Embed, duration=None):
         super().__init__(timeout=None)
         self.gid = gid
         self.embed = embed
+        self.add_item(SeekPositionSelect(duration))
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         vc = inter.guild.voice_client
@@ -257,10 +327,13 @@ class NowPlayingView(discord.ui.View):
         vc = inter.guild.voice_client
         if vc.is_playing():
             vc.pause()
+            mark_track_paused(self.gid)
             button.emoji, button.label = "▶️", "Tiếp tục"
         elif vc.is_paused():
             vc.resume()
+            mark_track_resumed(self.gid)
             button.emoji, button.label = "⏸️", "Tạm dừng"
+        auto_paused.discard(self.gid)  # Người dùng đã tự quyết định, không tự tiếp tục nữa
         await inter.response.edit_message(view=self)
 
     @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.primary, row=0)
@@ -311,6 +384,64 @@ class NowPlayingView(discord.ui.View):
             )
         await inter.response.send_message(text, ephemeral=True)
 
+    @discord.ui.button(label="⏪ -15 giây", style=discord.ButtonStyle.secondary, row=3)
+    async def seek_back_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        target = max(0, int(current_position(self.gid) - 15))
+        await seek_interaction(inter, target)
+
+    @discord.ui.button(label="+15 giây ⏩", style=discord.ButtonStyle.secondary, row=3)
+    async def seek_forward_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+        target = int(current_position(self.gid) + 15)
+        await seek_interaction(inter, target)
+
+
+# ==================== KÊNH THOẠI TRỐNG: TẠM DỪNG / TIẾP TỤC ====================
+
+def listener_count(channel) -> int:
+    """Số người thật đang ở trong kênh thoại (không tính bot).
+
+    Dùng voice_states thay vì channel.members, vì members chỉ có người đã nằm
+    trong bộ nhớ đệm thành viên (bot này không bật members intent).
+    """
+    me = bot.user.id if bot.user else None
+    count = 0
+    for user_id in channel.voice_states:
+        if user_id == me:
+            continue
+        member = channel.guild.get_member(user_id)
+        if member is not None and member.bot:
+            continue
+        count += 1
+    return count
+
+
+async def refresh_listening(guild: discord.Guild):
+    """Không còn ai trong kênh -> tạm dừng (bot vẫn ở lại). Có người quay lại -> tiếp tục."""
+    gid = guild.id
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return
+
+    if listener_count(vc.channel) == 0:
+        # Chỉ tự tạm dừng khi bài đang phát; bài người dùng đã tạm dừng thì để nguyên
+        if vc.is_playing():
+            vc.pause()
+            mark_track_paused(gid)
+            auto_paused.add(gid)
+            print(f"[{gid}] Kênh thoại trống: tạm dừng, bot vẫn ở lại.")
+        return
+
+    if gid in auto_paused:
+        auto_paused.discard(gid)
+        if vc.is_paused():
+            vc.resume()
+            mark_track_resumed(gid)
+            print(f"[{gid}] Có người quay lại: tiếp tục phát.")
+
+    if gid in waiting_for_listener:
+        waiting_for_listener.discard(gid)
+        await play_next(guild)
+
 
 # ==================== PLAY NEXT ====================
 
@@ -329,6 +460,12 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
 
     await clear_menu(gid)
 
+    # Kênh thoại đang trống: không phát cho không ai nghe, chờ có người vào lại
+    if listener_count(vc.channel) == 0:
+        waiting_for_listener.add(gid)
+        return
+    waiting_for_listener.discard(gid)
+
     q = queues[gid]
     auto_id = None  # id video nếu bài này do bot tự chọn
 
@@ -345,9 +482,6 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
         query = random.choice(choices)
     elif autoplay[gid]:
         # Hết hàng đợi và không có danh sách nhạc: tự mở bài liên quan như YouTube
-        if not [m for m in vc.channel.members if not m.bot]:
-            return  # Không còn ai nghe thì không phát tiếp
-
         seed = now_data.get(gid) or {}
         loop = asyncio.get_running_loop()
         found = await loop.run_in_executor(
@@ -389,6 +523,12 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
         queues[gid].insert(0, query)
         return
 
+    # Hoặc mọi người đã rời kênh trong lúc tìm bài: giữ bài lại, chờ có người về
+    if listener_count(vc.channel) == 0:
+        queues[gid].insert(0, query)
+        waiting_for_listener.add(gid)
+        return
+
     current_song[gid] = query
     now_data[gid] = data
     titles[query] = data["title"]
@@ -398,20 +538,14 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
         recent_ids[gid].append(data["yt_id"])
         recent_ids[gid] = recent_ids[gid][-100:]
 
-    def after(error):
-        if error:
-            print("Lỗi phát nhạc:", error)
-
-        future = asyncio.run_coroutine_threadsafe(
-            play_next(guild, channel), bot.loop
-        )
-
     try:
         audio = discord.FFmpegPCMAudio(data["url"], **FFMPEG_OPTS)
         source = discord.PCMVolumeTransformer(
             audio, volume=volumes[gid]
         )
-        vc.play(source, after=after)
+        vc.play(source, after=make_after_callback(guild, channel, gid))
+        play_positions[gid] = 0.0
+        play_started_at[gid] = time.monotonic()
     except Exception as exc:
         print("Không thể phát:", exc)
         return await play_next(guild, channel)
@@ -419,21 +553,138 @@ async def play_next(guild: discord.Guild, channel=None, retries: int = 0):
     try:
         embed = build_now_playing_embed(data, gid, auto=bool(auto_id))
         now_playing_msg[gid] = await channel.send(
-            embed=embed, view=NowPlayingView(gid, embed)
+            embed=embed, view=NowPlayingView(gid, embed, data.get("duration"))
         )
     except Exception as exc:
         print("Không gửi được menu (thiếu quyền Embed Links?):", exc)
 
 
+def make_after_callback(guild: discord.Guild, channel, gid: int):
+    """Callback chung cho kết thúc bài; bỏ qua callback do tua/dừng bot."""
+    def after(error):
+        if error:
+            print("Lỗi phát nhạc:", error)
+        if gid in seeking or gid in stopping:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(play_next(guild, channel), bot.loop)
+        except Exception as exc:
+            print("Không lên lịch được bài tiếp theo:", exc)
+    return after
+
+
+async def seek_to(guild: discord.Guild, channel, target: int) -> int:
+    """Khởi động lại stream tại giây đích bằng FFmpeg -ss."""
+    gid = guild.id
+    vc = guild.voice_client
+    data = now_data.get(gid)
+    if not vc or not vc.is_connected():
+        raise RuntimeError("Bot chưa ở trong kênh thoại.")
+    if not data or not data.get("url"):
+        raise RuntimeError("Không có bài hát để tua.")
+    if not vc.is_playing() and not vc.is_paused():
+        raise RuntimeError("Hiện không có bài đang phát để tua.")
+    duration = data.get("duration")
+    if not duration or int(duration) < 2:
+        raise RuntimeError("Bài này không có thời lượng xác định nên không thể tua.")
+
+    target = max(0, min(int(target), int(duration) - 1))
+    was_paused = vc.is_paused()
+    seeking.add(gid)
+    try:
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+            # Đợi callback của nguồn cũ chạy xong khi cờ seeking vẫn đang bật.
+            await asyncio.sleep(0.25)
+
+        ffmpeg_opts = dict(FFMPEG_OPTS)
+        ffmpeg_opts["before_options"] = f"-ss {target} " + ffmpeg_opts["before_options"]
+        audio = discord.FFmpegPCMAudio(data["url"], **ffmpeg_opts)
+        source = discord.PCMVolumeTransformer(audio, volume=volumes[gid])
+        vc.play(source, after=make_after_callback(guild, channel, gid))
+        play_positions[gid] = float(target)
+        if was_paused:
+            vc.pause()
+            play_started_at.pop(gid, None)
+        else:
+            play_started_at[gid] = time.monotonic()
+        return target
+    finally:
+        # Giữ cờ thêm một chút để callback của vc.stop không phát nhầm bài kế tiếp.
+        await asyncio.sleep(0.25)
+        seeking.discard(gid)
+
+
+async def seek_interaction(inter: discord.Interaction, target: int):
+    await inter.response.defer(ephemeral=True, thinking=True)
+    try:
+        actual = await seek_to(inter.guild, inter.channel, target)
+        await inter.followup.send(f"⏩ Đã tua đến **{fmt_duration(actual)}**.", ephemeral=True)
+    except Exception as exc:
+        await inter.followup.send(f"❌ Không tua được: {str(exc)[:180]}", ephemeral=True)
+
+
 # ==================== DISCORD BOT ====================
+
+class MusicCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Ghi nhớ đúng kênh đã sử dụng lệnh để dọn tin nhắn cũ tại kênh đó.
+        if interaction.guild_id and interaction.channel:
+            command_channels[interaction.guild_id] = interaction.channel
+        return True
+
 
 class MusicBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
-        self.tree = app_commands.CommandTree(self)
+        self.tree = MusicCommandTree(self)
+        self.cleanup_task = None
 
     async def setup_hook(self):
         await self.tree.sync()
+        if self.cleanup_task is None:
+            self.cleanup_task = asyncio.create_task(self.cleanup_old_messages_loop())
+
+    async def cleanup_old_messages_loop(self):
+        """Định kỳ xóa tin nhắn cũ do chính bot gửi trong các kênh đã dùng lệnh."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(MESSAGE_CLEANUP_INTERVAL_SECONDS)
+            if not self.user:
+                continue
+            cutoff = discord.utils.utcnow() - timedelta(seconds=BOT_MESSAGE_TTL_SECONDS)
+            for gid, channel in list(command_channels.items()):
+                if not channel or not hasattr(channel, "history"):
+                    continue
+                active_menu = now_playing_msg.get(gid)
+                keep_id = active_menu.id if active_menu else None
+                try:
+                    async for message in channel.history(limit=200, before=cutoff):
+                        if message.author.id != self.user.id or message.id == keep_id:
+                            continue
+                        try:
+                            await message.delete()
+                            await asyncio.sleep(0.1)
+                        except discord.NotFound:
+                            pass
+                        except discord.Forbidden:
+                            print(f"Không có quyền xóa tin nhắn cũ tại kênh {channel.id}.")
+                            break
+                        except discord.HTTPException as exc:
+                            print(f"Không xóa được tin nhắn {message.id}: {exc}")
+                except discord.Forbidden:
+                    print(f"Không có quyền đọc lịch sử tin nhắn tại kênh {channel.id}.")
+                except discord.HTTPException as exc:
+                    print(f"Lỗi dọn lịch sử kênh {channel.id}: {exc}")
+
+    async def on_voice_state_update(self, member, before, after):
+        vc = member.guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+        # Chỉ quan tâm khi có người vào/ra kênh của bot, hoặc chính bot bị chuyển kênh
+        if member.id != self.user.id and vc.channel not in (before.channel, after.channel):
+            return
+        await refresh_listening(member.guild)
 
 
 bot = MusicBot()
@@ -567,53 +818,172 @@ async def return_song(inter: discord.Interaction):
 
 # ==================== /SKIP-TO ====================
 
+
+def queue_item_title(query: str) -> str:
+    """Tên dễ đọc cho bài đang chờ; ưu tiên tiêu đề đã được bot phân giải."""
+    return titles.get(query, query).strip() or query
+
+
+class SkipToSelect(discord.ui.Select):
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        start = parent_view.page * 25
+        page_items = parent_view.snapshot[start:start + 25]
+        options = []
+        for index, item in enumerate(page_items, start=start):
+            label = f"{index + 1}. {queue_item_title(item)}"[:100]
+            options.append(discord.SelectOption(
+                label=label,
+                value=str(index),
+                description=f"Phát từ vị trí {index + 1} trong hàng đợi"[:100],
+            ))
+        super().__init__(
+            placeholder="Chọn bài muốn chuyển đến…",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        await self.parent_view.choose(inter, int(self.values[0]))
+
+
+class SkipToView(discord.ui.View):
+    """Danh sách chọn bài skip-to, hỗ trợ hàng đợi dài hơn 25 bài."""
+
+    def __init__(self, guild: discord.Guild, channel, snapshot: list[str]):
+        super().__init__(timeout=180)
+        self.guild = guild
+        self.channel = channel
+        self.gid = guild.id
+        self.snapshot = list(snapshot)
+        self.page = 0
+        self.message = None
+        self.refresh_items()
+
+    def build_embed(self) -> discord.Embed:
+        total = len(self.snapshot)
+        page_count = max(1, (total + 24) // 25)
+        start = self.page * 25
+        lines = [
+            f"**{i + 1}.** {queue_item_title(item)[:115]}"
+            for i, item in enumerate(self.snapshot[start:start + 25], start=start)
+        ]
+        embed = discord.Embed(
+            title=f"📜 Hàng đợi nhạc ({total} bài)",
+            description="\n".join(lines) if lines else "Hàng đợi đang trống.",
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=f"Trang {self.page + 1}/{page_count} • Chọn bài trong menu bên dưới")
+        return embed
+
+    def refresh_items(self):
+        self.clear_items()
+        if not self.snapshot:
+            return
+        self.add_item(SkipToSelect(self))
+        page_count = max(1, (len(self.snapshot) + 24) // 25)
+        previous_button = discord.ui.Button(
+            label="◀ Trang trước", style=discord.ButtonStyle.secondary,
+            row=1, disabled=self.page <= 0,
+        )
+        next_button = discord.ui.Button(
+            label="Trang sau ▶", style=discord.ButtonStyle.secondary,
+            row=1, disabled=self.page >= page_count - 1,
+        )
+        previous_button.callback = self.previous_page
+        next_button.callback = self.next_page
+        self.add_item(previous_button)
+        self.add_item(next_button)
+
+    async def previous_page(self, inter: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self.refresh_items()
+        await inter.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def next_page(self, inter: discord.Interaction):
+        page_count = max(1, (len(self.snapshot) + 24) // 25)
+        self.page = min(page_count - 1, self.page + 1)
+        self.refresh_items()
+        await inter.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def choose(self, inter: discord.Interaction, index: int):
+        q = queues[self.gid]
+        if list(q) != self.snapshot:
+            self.snapshot = list(q)
+            self.page = min(self.page, max(0, (len(self.snapshot) - 1) // 25))
+            self.refresh_items()
+            if self.snapshot:
+                return await inter.response.edit_message(
+                    content="⚠️ Hàng đợi vừa thay đổi. Đây là danh sách mới; hãy chọn lại bài.",
+                    embed=self.build_embed(), view=self,
+                )
+            return await inter.response.edit_message(
+                content="📜 Hàng đợi hiện đã trống.", embed=None, view=None,
+            )
+
+        vc = self.guild.voice_client
+        if not vc or not vc.is_connected():
+            return await inter.response.send_message(
+                "❌ Bot không còn ở trong kênh thoại.", ephemeral=True,
+            )
+        if index < 0 or index >= len(q):
+            return await inter.response.send_message(
+                "❌ Vị trí này không còn trong hàng đợi.", ephemeral=True,
+            )
+
+        selected = q[index]
+        del q[:index]  # Đưa bài được chọn lên đầu, bỏ các bài đứng trước nó.
+        play_channels[self.gid] = self.channel
+        await inter.response.edit_message(
+            content=f"⏭️ Đang chuyển đến **{queue_item_title(selected)[:180]}** (vị trí {index + 1}).",
+            embed=None,
+            view=None,
+        )
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()  # Callback sẽ phát bài đã được đưa lên đầu hàng đợi.
+        else:
+            await play_next(self.guild, self.channel)
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.delete()
+            except Exception:
+                try:
+                    await self.message.edit(view=None)
+                except Exception:
+                    pass
+
+
 @bot.tree.command(
     name="skip-to",
-    description="Chuyển thẳng đến bài được chọn trong hàng đợi"
-)
-@app_commands.describe(
-    position="Số thứ tự bài trong hàng đợi (1 là bài kế tiếp)"
+    description="Hiện hàng đợi và chọn bài muốn chuyển đến",
 )
 @app_commands.guild_only()
-async def skip_to(
-    inter: discord.Interaction,
-    position: app_commands.Range[int, 1, 100]
-):
+async def skip_to(inter: discord.Interaction):
     gid = inter.guild_id
     vc = inter.guild.voice_client
     q = queues[gid]
 
     if not vc or not vc.is_connected():
         return await inter.response.send_message(
-            "❌ Bot chưa ở trong kênh thoại.", ephemeral=True
+            "❌ Bot chưa ở trong kênh thoại.", ephemeral=True,
         )
-
     if not q:
         return await inter.response.send_message(
-            "❌ Hàng đợi đang trống. Dùng `/play` để thêm bài trước.",
-            ephemeral=True
+            "📜 Hàng đợi đang trống. Dùng `/play` để thêm bài trước.", ephemeral=True,
         )
 
-    if position > len(q):
-        return await inter.response.send_message(
-            f"❌ Hàng đợi chỉ có **{len(q)} bài**. Hãy chọn số từ 1 đến {len(q)}.",
-            ephemeral=True
-        )
-
-    # Chọn bài ở vị trí position; bỏ các bài đứng trước nó trong hàng đợi.
-    selected = q[position - 1]
-    del q[:position - 1]
-    play_channels[gid] = inter.channel
-
+    view = SkipToView(inter.guild, inter.channel, list(q))
     await inter.response.send_message(
-        f"⏭️ Đang chuyển đến bài số **{position}** trong hàng đợi: **{selected[:150]}**."
+        "Chọn bài trong danh sách để bot bỏ qua các bài đứng trước và phát bài đó:",
+        embed=view.build_embed(),
+        view=view,
+        ephemeral=True,
     )
-
-    if vc.is_playing() or vc.is_paused():
-        # after callback sẽ gọi play_next và phát bài được chọn đầu hàng đợi
-        vc.stop()
-    else:
-        await play_next(inter.guild, inter.channel)
+    view.message = await inter.original_response()
 
 
 # ==================== /PAUSE ====================
@@ -624,6 +994,8 @@ async def pause(inter: discord.Interaction):
     vc = inter.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
+        mark_track_paused(inter.guild_id)
+        auto_paused.discard(inter.guild_id)
         await inter.response.send_message("⏸️ Đã tạm dừng.")
     else:
         await inter.response.send_message(
@@ -639,6 +1011,8 @@ async def resume(inter: discord.Interaction):
     vc = inter.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
+        mark_track_resumed(inter.guild_id)
+        auto_paused.discard(inter.guild_id)
         await inter.response.send_message("▶️ Tiếp tục phát nhạc.")
     else:
         await inter.response.send_message(
@@ -879,6 +1253,10 @@ async def stop(inter: discord.Interaction):
 
     current_song.pop(gid, None)
     now_data.pop(gid, None)
+    play_positions.pop(gid, None)
+    play_started_at.pop(gid, None)
+    auto_paused.discard(gid)
+    waiting_for_listener.discard(gid)
     await clear_menu(gid)
 
 # ==================== /SEARCH ====================
@@ -903,7 +1281,7 @@ def search_youtube(query: str, limit: int = 10) -> list[dict]:
 
 
 def fmt_duration(sec) -> str:
-    if not sec:
+    if sec is None:
         return "--:--"
     sec = int(sec)
     h, rest = divmod(sec, 3600)
@@ -942,6 +1320,7 @@ class SearchSelect(discord.ui.Select):
                 await vc.move_to(inter.user.voice.channel)
 
             play_channels[gid] = inter.channel
+            titles[chosen["url"]] = chosen["title"]
             queues[gid].append(chosen["url"])
             self.view.stop()
             await inter.edit_original_response(
@@ -971,9 +1350,12 @@ class SearchView(discord.ui.View):
     async def on_timeout(self):
         if self.message:
             try:
-                await self.message.edit(content="⌛ Hết thời gian chọn.", view=None)
+                await self.message.delete()
             except Exception:
-                pass
+                try:
+                    await self.message.edit(content="⌛ Hết thời gian chọn.", view=None)
+                except Exception:
+                    pass
 
 
 @bot.tree.command(name="search", description="Tìm bài trên YouTube rồi chọn bài để phát")
